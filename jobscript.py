@@ -1,124 +1,127 @@
 import os
 import time
+import json
 import requests
 import hashlib
+from datetime import datetime
 from bs4 import BeautifulSoup
-import schedule
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+SEEN_JOBS_FILE = os.getenv("SEEN_JOBS_FILE", "seen_jobs.json")
+SCRAPE_INTERVAL_MINUTES = 60
 
-sent_jobs = set()
-SENT_FILE = "sent_jobs.txt"
-if os.path.exists(SENT_FILE):
-    with open(SENT_FILE) as f:
-        sent_jobs = set(line.strip() for line in f)
+def load_seen_jobs():
+    if os.path.exists(SEEN_JOBS_FILE):
+        return set(json.load(open(SEEN_JOBS_FILE)))
+    return set()
 
-def send_to_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, data={
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    })
-    print(f"[TELE] status={resp.status_code}")
+def save_seen_jobs(seen_jobs):
+    os.makedirs(os.path.dirname(SEEN_JOBS_FILE) or ".", exist_ok=True)
+    with open(SEEN_JOBS_FILE, "w") as f:
+        json.dump(list(seen_jobs), f)
 
-def save_job(hash_id):
-    sent_jobs.add(hash_id)
-    with open(SENT_FILE, "a") as f:
-        f.write(hash_id + "\n")
-
-def job_hash(source, title, company, link):
-    return hashlib.md5(f"{source}|{title}|{company}|{link}".encode()).hexdigest()
-
-def fetch_linkedin():
-    src="LinkedIn"
-    url = ("https://www.linkedin.com/jobs/search/"
-           "?keywords=software%20developer%20OR%20engineer&location=Mumbai"
-           "&f_E=1&f_TPR=r604800")
-    soup = BeautifulSoup(requests.get(url, headers={"User-Agent":"Mozilla/5.0"}).text, "html.parser")
-    for card in soup.select(".base-card"):
-        t=card.select_one("h3"); c=card.select_one("h4"); a=card.select_one("a.base-card__full-link")
-        if not (t and c and a): continue
-        title, company, link = t.text.strip(), c.text.strip(), a["href"].split("?")[0]
-        h = job_hash(src, title, company, link)
-        if h in sent_jobs: continue
-        save_job(h)
-        yield f"[{src}] <b>{title}</b>\n{company}\n🔗 {link}"
-
-def fetch_indeed():
-    src="Indeed"
-    for role in ["software+developer","software+engineer","web+developer"]:
-        url=f"https://in.indeed.com/jobs?q={role}&l=Mumbai&fromage=7"
-        soup=BeautifulSoup(requests.get(url,headers={"User-Agent":"Mozilla/5.0"}).text,"html.parser")
-        for a in soup.select("a[data-jk]"):
-            link="https://in.indeed.com/viewjob?jk="+a["data-jk"]
-            title=a.select_one("span") and a.select_one("span").text.strip() or "N/A"
-            company="Indeed Listing"
-            h=job_hash(src,title,company,link)
-            if h in sent_jobs: continue
-            save_job(h)
-            yield f"[{src}] <b>{title}</b>\n{company}\n🔗 {link}"
-
-def fetch_internshala():
-    src="Internshala"
-    for role in ["software-developer","software-engineer","web-developer"]:
-        url=f"https://internshala.com/internships/{role}-internship-in-mumbai"
-        soup=BeautifulSoup(requests.get(url,headers={"User-Agent":"Mozilla/5.0"}).text,"html.parser")
-        for d in soup.select(".individual_internship_header"):
-            a=d.select_one("a")
-            title=a.text.strip()
-            link="https://internshala.com"+a["href"]
-            comp=d.find_next_sibling("div").text.split('•')[0].strip()
-            h=job_hash(src,title,comp,link)
-            if h in sent_jobs: continue
-            save_job(h)
-            yield f"[{src}] <b>{title}</b>\n{comp}\n🔗 {link}"
-
-def fetch_naukri():
-    src="Naukri"
-    for role in ["software-developer","software-engineer","web-developer"]:
-        url=f"https://www.naukri.com/{role}-jobs-in-mumbai?k={role}&l=mumbai&experience=0"
-        soup=BeautifulSoup(requests.get(url,headers={"User-Agent":"Mozilla/5.0"}).text,"html.parser")
-        for art in soup.select("article.jobTuple"):
-            t=art.select_one("a.title"); c=art.select_one("a.subTitle")
-            if not (t and c): continue
-            title, comp, link = t.text.strip(), c.text.strip(), t["href"]
-            h=job_hash(src,title,comp,link)
-            if h in sent_jobs: continue
-            save_job(h)
-            yield f"[{src}] <b>{title}</b>\n{comp}\n🔗 {link}"
-
-def fetch_foundit():
-    src="Foundit"
-    for role in ["software-developer","software-engineer","web-developer"]:
-        url=f"https://www.foundit.in/search/{role}-jobs-in-mumbai"
-        soup=BeautifulSoup(requests.get(url,headers={"User-Agent":"Mozilla/5.0"}).text,"html.parser")
-        for card in soup.select(".job-tuple")[:10]:
-            t=card.select_one("h3"); c=card.select_one(".company-name"); a=card.select_one("a")
-            if not (t and c and a): continue
-            title, comp = t.text.strip(), c.text.strip()
-            link="https://www.foundit.in"+a["href"]
-            h=job_hash(src,title,comp,link)
-            if h in sent_jobs: continue
-            save_job(h)
-            yield f"[{src}] <b>{title}</b>\n{comp}\n🔗 {link}"
-
-def job_runner():
-    print("[START] Running job check...")
-    msgs = list(fetch_linkedin()) + list(fetch_indeed()) + list(fetch_internshala()) + list(fetch_naukri()) + list(fetch_foundit())
-    if msgs:
-        payload="🚀 <b>New jobs found:</b>\n\n" + "\n\n".join(msgs)
+def send_to_telegram(new_jobs):
+    if new_jobs:
+        msg = "🚀 *New Jobs (Last Hour)*\n\n" + "\n\n".join(
+            f"{src} • *{title}*\n{link}" for src, title, link in new_jobs
+        )
     else:
-        payload="✅ No new jobs found this hour. Bot is alive."
-    send_to_telegram(payload)
-    print("[TELEGRAM] Message sent.")
+        msg = "✅ No new jobs found in the last hour."
 
-schedule.every(1).hours.do(job_runner)
+    resp = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+    )
+    print(f"[TELEGRAM] status {resp.status_code}")
+
+def fetch_jobs(url, parser_func):
+    try:
+        return parser_func(requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text)
+    except Exception as e:
+        print(f"[ERROR] Scraping failed for {url}: {e}")
+        return []
+
+def scrape_linkedin(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs = []
+    for card in soup.select(".base-card"):
+        t = card.select_one("h3")
+        a = card.select_one("a.base-card__full-link")
+        if t and a:
+            jobs.append(("LinkedIn", t.get_text(strip=True), a["href"].split("?")[0]))
+    return jobs
+
+def scrape_indeed(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs = []
+    for a in soup.select("a[data-jk]"):
+        span = a.select_one("span")
+        if span:
+            jobs.append(("Indeed", span.text.strip(), "https://in.indeed.com/viewjob?jk=" + a["data-jk"]))
+    return jobs
+
+def scrape_internshala(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs, titles = [], soup.select(".individual_internship_header .heading_4_5")
+    links = soup.select(".individual_internship_header a")
+    for t, a in zip(titles, links):
+        link = a["href"]
+        if not link.startswith("http"):
+            link = "https://internshala.com" + link
+        jobs.append(("Internshala", t.get_text(strip=True), link))
+    return jobs
+
+def scrape_naukri(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs = []
+    for art in soup.select("article.jobTuple"):
+        t = art.select_one("a.title")
+        if t:
+            jobs.append(("Naukri", t.text.strip(), t["href"]))
+    return jobs
+
+def scrape_foundit(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs = []
+    for card in soup.select(".job-tuple")[:10]:
+        t = card.select_one("h3")
+        a = card.select_one("a")
+        if t and a:
+            jobs.append(("Foundit", t.text.strip(), "https://www.foundit.in" + a["href"]))
+    return jobs
+
+SCRAPERS = [
+    ("LinkedIn", "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=Software%20Engineer%20OR%20Web%20Developer&location=Mumbai&f_E=1%2C2&f_TPR=r604800", scrape_linkedin),
+    ("Indeed", "https://in.indeed.com/jobs?q=software+developer&l=Mumbai&fromage=7", scrape_indeed),
+    ("Internshala", "https://internshala.com/internships/web-development-internship-in-mumbai", scrape_internshala),
+    ("Naukri", "https://www.naukri.com/software-developer-jobs-in-mumbai?experience=0", scrape_naukri),
+    ("Foundit", "https://www.foundit.in/search/software-developer-jobs-in-mumbai", scrape_foundit),
+]
+
+def main():
+    seen = load_seen_jobs()
+    print(f"[START] Loaded {len(seen)} seen jobs")
+
+    while True:
+        new_jobs = []
+        for src, url, parser in SCRAPERS:
+            print(f"[INFO] Scraping {src}...")
+            html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
+            for job in parser(html):
+                key = hashlib.md5(job[2].encode()).hexdigest()
+                if key not in seen:
+                    seen.add(key)
+                    new_jobs.append(job)
+        send_to_telegram(new_jobs)
+        save_seen_jobs(seen)
+        print(f"[END] Cycle complete — sleeping {SCRAPE_INTERVAL_MINUTES} minutes.")
+        time.sleep(SCRAPE_INTERVAL_MINUTES * 60)
 
 if __name__ == "__main__":
-    job_runner()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    main()
