@@ -68,7 +68,7 @@ def scrape_jobs():
             f"?keywords={role}"
             f"&location={LOCATION}"
             f"&f_E=1&f_TP=1&f_WT=2&f_AL=true"
-            f"&f_TPR=r86400"  # ✅ Filter: Posted in last 24 hours
+           f"&f_TPR=r604800"  # ✅ Filter: Posted in last 24 hours
         )
 
         try:
