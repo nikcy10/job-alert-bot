@@ -1,27 +1,16 @@
 import os
 import time
 import requests
-import hashlib
+import schedule
 from bs4 import BeautifulSoup
 
 # Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# File to store sent jobs
-SENT_JOBS_FILE = "sent_jobs.txt"
-SENT_JOBS = set()
+sent_jobs = set()
 
-# Load previously sent jobs
-if os.path.exists(SENT_JOBS_FILE):
-    with open(SENT_JOBS_FILE, "r") as f:
-        for line in f:
-            SENT_JOBS.add(line.strip())
-
-print(f"[INFO] Loaded {len(SENT_JOBS)} previously sent jobs.")
-
-# Send message to Telegram
-def send_telegram_message(message):
+def send_to_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
         "chat_id": CHAT_ID,
@@ -31,63 +20,52 @@ def send_telegram_message(message):
     response = requests.post(url, data=data)
     print(f"[INFO] Telegram response: {response.status_code}")
 
-# Unique job hash
-def job_hash(title, company, link):
-    return hashlib.md5(f"{title}{company}{link}".encode()).hexdigest()
+def fetch_linkedin_jobs():
+    print("[INFO] Searching LinkedIn for new jobs...")
+    url = "https://www.linkedin.com/jobs/search?keywords=Software%20Developer&location=Mumbai%2C%20Maharashtra%2C%20India&f_TPR=r604800&f_E=1&f_E=2"
 
-# Scrape LinkedIn jobs
-def search_linkedin_jobs():
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
 
-    url = "https://www.linkedin.com/jobs/search/?keywords=software%20engineer%20OR%20web%20developer%20OR%20frontend%20developer%20OR%20backend%20developer&location=Mumbai&f_E=1&f_TPR=r604800"
+    try:
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        job_cards = soup.find_all("a", class_="base-card__full-link")
+        print(f"[INFO] Found {len(job_cards)} job cards.")
 
-    print("[INFO] Searching LinkedIn for new jobs...")
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
-    results = soup.select(".base-card")
+        new_jobs = 0
+        for job in job_cards:
+            job_link = job.get("href")
+            job_title = job.get("aria-label", "Job")
+            company_name = job.find_previous("h4").text.strip() if job.find_previous("h4") else "Unknown"
 
-    print(f"[INFO] Found {len(results)} job cards.")
+            if "*" in job_title or "*" in company_name:
+                print(f"[SKIPPED] Obfuscated job: {job_title} at {company_name}")
+                continue
 
-    jobs = []
-    for card in results:
-        title_elem = card.select_one("h3.base-search-card__title")
-        company_elem = card.select_one("h4.base-search-card__subtitle")
-        link_elem = card.select_one("a.base-card__full-link")
+            if job_link not in sent_jobs:
+                message = f"[NEW JOB] {job_title} at {company_name} — {job_link}"
+                send_to_telegram(message)
+                sent_jobs.add(job_link)
+                new_jobs += 1
 
-        if title_elem and company_elem and link_elem:
-            title = title_elem.text.strip()
-            company = company_elem.text.strip()
-            link = link_elem["href"].split("?")[0]
+        if new_jobs == 0:
+            send_to_telegram("✅ No new jobs found this hour. Staying vigilant!")
 
-            hash_id = job_hash(title, company, link)
-            if hash_id not in SENT_JOBS:
-                SENT_JOBS.add(hash_id)
-                with open(SENT_JOBS_FILE, "a") as f:
-                    f.write(f"{hash_id}\n")
-                jobs.append((title, company, link))
-                print(f"[NEW JOB] {title} at {company} — {link}")
-            else:
-                print(f"[SKIPPED] Already sent: {title} at {company}")
-    return jobs
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch jobs: {e}")
+        send_to_telegram("❌ Bot encountered an error while searching jobs.")
 
-# Master function
-def check_jobs():
-    new_jobs = search_linkedin_jobs()
-    if new_jobs:
-        message = "📢 <b>New Job Alerts:</b>\n\n"
-        for title, company, link in new_jobs:
-            message += f"<b>{title}</b>\n{company}\n<a href='{link}'>Apply Here</a>\n\n"
-        send_telegram_message(message.strip())
-    else:
-        print("[INFO] No new jobs found.")
-        send_telegram_message("🔍 No new jobs found in the last hour.")
-
-# Run every hour
-if __name__ == "__main__":
+def job_runner():
     print("[START] Job bot is running...")
+    fetch_linkedin_jobs()
+    print("[WAIT] Sleeping for 1 hour...")
+
+schedule.every(1).hours.do(job_runner)
+
+if __name__ == "__main__":
+    job_runner()  # run once at start
     while True:
-        check_jobs()
-        print("[WAIT] Sleeping for 1 hour...\n")
-        time.sleep(3600)
+        schedule.run_pending()
+        time.sleep(1)
